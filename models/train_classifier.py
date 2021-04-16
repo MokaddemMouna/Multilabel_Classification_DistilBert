@@ -4,12 +4,13 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 import gc
+import pickle
 import torch
 from torch.nn import BCEWithLogitsLoss, BCELoss
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 from transformers import *
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score, accuracy_score
+from sklearn.metrics import f1_score, accuracy_score, classification_report
 from tqdm import tqdm, trange
 
 
@@ -30,8 +31,9 @@ n_gpu = torch.cuda.device_count()
 torch.cuda.get_device_name(0)
 
 categories = []
+max_length = 300
 batch_size = 32 # batch size
-epochs = 3 # Number of training epochs (authors recommend between 2 and 4)
+epochs = 10 # Number of training epochs (authors recommend between 2 and 4)
 
 def load_data_and_build_labels():
     global categories
@@ -95,7 +97,7 @@ def prepare_data(df):
 
     tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased', do_lower_case=True)  # tokenizer
     # used the depricated version of the method because it outputs lists which I need to do the stratified split
-    encodings = tokenizer.batch_encode_plus(samples,max_length=400, padding=True,truncation=True)
+    encodings = tokenizer.batch_encode_plus(samples,max_length=max_length, padding=True,truncation=True)
     input_ids = encodings['input_ids']  # tokenized and encoded sentences
     attention_masks = encodings['attention_mask']  # attention masks
 
@@ -138,10 +140,13 @@ def prepare_data(df):
     validation_dataloader = DataLoader(validation_data, sampler=validation_sampler, batch_size=batch_size)
 
     test_data = TensorDataset(test_inputs, test_masks, test_labels)
+    test_sampler = SequentialSampler(test_data)
+    test_dataloader = DataLoader(test_data, sampler=test_sampler, batch_size=batch_size)
 
     torch.save(validation_dataloader, 'validation_data_loader')
     torch.save(train_dataloader, 'train_data_loader')
-    torch.save(test_data,'test_data')
+    torch.save(test_dataloader,'test_data_loader')
+    torch.save(categories, 'labels')
 
 def train_and_validate():
 
@@ -166,11 +171,23 @@ def train_and_validate():
     ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=2e-5, correct_bias=True)
 
-    # Store the loss and accuracy for plotting
+    # Store the loss and accuracy for plotting if needed
     train_loss_set = []
 
+    # Store the F1 to stop training if F1 flattens
+    f1_set = []
+
     # trange is a tqdm wrapper around the normal python range
-    for _ in trange(epochs, desc="Epoch"):
+    for i in trange(epochs, desc="Epoch"):
+        # check if F1 has flattened, note here that because of computational capicity limitation, I assume that flatten
+        # for me is only to check that between the last epoch and current epoch the gain in F1 micro was smaller than 1%
+        # otherwise if F1 ccontinues to grow that it will capped by the # epochs
+        if i > 1:
+            f1_current = f1_set[-1]
+            f1_previous = f1_set[-2]
+            diff = f1_current - f1_previous
+            if diff < 1:
+                break
 
         # Training
 
@@ -249,17 +266,106 @@ def train_and_validate():
         threshold = 0.50
         pred_bools = [pl > threshold for pl in pred_labels]
         true_bools = [tl == 1 for tl in true_labels]
-        val_f1_accuracy = f1_score(true_bools, pred_bools, average='micro') * 100
+        val_f1_accuracy_macro = f1_score(true_bools, pred_bools, average='macro') * 100
+        val_f1_accuracy_micro = f1_score(true_bools, pred_bools, average='micro') * 100
         val_flat_accuracy = accuracy_score(true_bools, pred_bools) * 100
 
-        print('F1 Validation Accuracy: ', val_f1_accuracy)
+        f1_set.append(val_f1_accuracy_micro)
+
+        print('F1 Validation Score Micro: ', val_f1_accuracy_micro)
+        print('\n F1 Validation Score Macro: ', val_f1_accuracy_macro)
         print('Flat Validation Accuracy: ', val_flat_accuracy)
+
+    # store the best model
+    torch.save(model.state_dict(), 'finetuned_distilbert')
+
+    # finetune the threshold by maximizing F1 first with macro_thresholds on the order of e ^ -1 then with
+    # micro_thresholds on the order of e ^ -2
+    macro_thresholds = np.array(range(1, 10)) / 10
+
+    f1_results, flat_acc_results = [], []
+    for th in macro_thresholds:
+        pred_bools = [pl > th for pl in pred_labels]
+        validation_f1_accuracy = f1_score(true_bools, pred_bools, average='macro')
+        f1_results.append(validation_f1_accuracy)
+
+    best_macro_th = macro_thresholds[np.argmax(f1_results)]  # best macro threshold value
+
+    micro_thresholds = (np.array(range(10)) / 100) + best_macro_th  # calculating micro threshold values
+
+    f1_results, flat_acc_results = [], []
+    for th in micro_thresholds:
+        pred_bools = [pl > th for pl in pred_labels]
+        test_f1_accuracy = f1_score(true_bools, pred_bools, average='micro')
+        f1_results.append(test_f1_accuracy)
+
+    best_threshold = micro_thresholds[np.argmax(f1_results)]  # best threshold value
+    # store the best threshold value
+    torch.save(best_threshold, 'best_classification_threshold')
+
+
+def test_and_print_report():
+
+    # load model
+    model = torch.load('finetuned_distilbert')
+    # load test dataloader
+    test_dataloader = torch.load('test_data_loader')
+    # load list of labels
+    labels = torch.load('labels')
+    # load best classification threshold
+    threshold = torch.load('best_classification_threshold')
+
+    # Put model in evaluation mode to evaluate loss on the test set
+    model.eval()
+
+    # track variables
+    logit_preds, true_labels, pred_labels, tokenized_texts = [], [], [], []
+
+    # Predict
+    for i, batch in enumerate(test_dataloader):
+        batch = tuple(t.to(device) for t in batch)
+        # Unpack the inputs from the dataloader
+        b_input_ids, b_input_mask, b_labels, b_token_types = batch
+        with torch.no_grad():
+            # Forward pass
+            outs = model(b_input_ids, token_type_ids=None, attention_mask=b_input_mask)
+            b_logit_pred = outs[0]
+            pred_label = torch.sigmoid(b_logit_pred)
+
+            b_logit_pred = b_logit_pred.detach().cpu().numpy()
+            pred_label = pred_label.to('cpu').numpy()
+            b_labels = b_labels.to('cpu').numpy()
+
+        tokenized_texts.append(b_input_ids)
+        logit_preds.append(b_logit_pred)
+        true_labels.append(b_labels)
+        pred_labels.append(pred_label)
+
+    # Flatten outputs
+    tokenized_texts = [item for sublist in tokenized_texts for item in sublist]
+    pred_labels = [item for sublist in pred_labels for item in sublist]
+    true_labels = [item for sublist in true_labels for item in sublist]
+    # Converting flattened binary values to boolean values
+    true_bools = [tl == 1 for tl in true_labels]
+
+    pred_bools = [pl > threshold for pl in pred_labels]  # boolean output after thresholding
+
+    # Print and save classification report
+    print('Test F1 Accuracy Micro: ', f1_score(true_bools, pred_bools, average='micro'))
+    print('Test F1 Accuracy Macro: ', f1_score(true_bools, pred_bools, average='macro'))
+    print('Test Flat Accuracy: ', accuracy_score(true_bools, pred_bools), '\n')
+    clf_report = classification_report(true_bools, pred_bools, target_names=labels)
+    pickle.dump(clf_report, open('classification_report.txt', 'wb'))  # save report
+    print(clf_report)
 
 
 
 train , validation, test = Path('./train_data_loader'), Path('./validation_data_loader'), Path('./test_data')
+finetuned_model = Path('./finetuned_distilbert')
 if not (train.is_file() and validation.is_file() and test.is_file()):
     data = load_data_and_build_labels()
     data = data_analysis_and_fix_data(data)
     prepare_data(data)
-train_and_validate()
+if not finetuned_model.is_file():
+    train_and_validate()
+test_and_print_report()

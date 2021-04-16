@@ -7,18 +7,37 @@ from flask import Flask
 from flask import render_template, request, jsonify
 from plotly.graph_objs import Bar
 from sqlalchemy import create_engine
+import sqlite3
 
+import torch
+from transformers import *
+
+from ..models import train_classifier
+
+max_length = train_classifier.max_length
 
 app = Flask(__name__)
 
 # TODO: implement tokenizer to tokenize input text
 def tokenize(text):
-    raise NotImplementedError()
+    tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased', do_lower_case=True)  # tokenizer
+    encoding = tokenizer(text, return_tensors='pt' , max_length=max_length, padding=True, truncation=True)
+    input_ids = encoding['input_ids']  # tokenized and encoded sentence
+    attention_masks = encoding['attention_mask']  # attention masks
+    return input_ids, attention_masks
 
 # TODO: load data form db into pandas df
+def load_data():
+    conn = sqlite3.connect('../data/db.sqlite')
+    df = pd.read_sql('select id, message, categories from disaster', conn)
+    df.set_index('id')
+    return df
 
 
 # TODO: load model
+def load_model():
+    model = torch.load('../models/finetuned_distilbert')
+    return model
 
 
 
@@ -26,7 +45,9 @@ def tokenize(text):
 @app.route('/')
 @app.route('/index')
 def index():
-    
+    # load data
+    df = load_data()
+
     # extract data needed for visuals
     # TODO: Below is an example - modify to extract data for your own visuals
     genre_counts = df.groupby('genre').count()['message']
