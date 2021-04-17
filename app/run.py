@@ -3,6 +3,7 @@ import joblib
 
 import plotly
 import pandas as pd
+import numpy as np
 from flask import Flask
 from flask import render_template, request, jsonify
 from plotly.graph_objs import Bar
@@ -12,9 +13,9 @@ import sqlite3
 import torch
 from transformers import *
 
-from ..models import train_classifier
 
-max_length = train_classifier.max_length
+# max_length = train_classifier.max_length
+max_length = 300
 
 app = Flask(__name__)
 
@@ -29,8 +30,26 @@ def tokenize(text):
 # TODO: load data form db into pandas df
 def load_data():
     conn = sqlite3.connect('../data/db.sqlite')
-    df = pd.read_sql('select id, message, categories from disaster', conn)
+    df = pd.read_sql('select id, message, original, genre, categories from disaster', conn)
     df.set_index('id')
+    categ = df.values[0][4].split(';')
+    categories = list(map(lambda el: el.split('-')[0], categ))
+
+    def extract_label(s):
+        l = s.split(';')
+        # there are some error in collecting the data where some labels are given 2 instead of 0/1,
+        # I will assume that 2 means 1 and fix it here when constructing one hot encoding
+        one_hot = list(map(
+            lambda el: int(el.split('-')[-1]) if int(el.split('-')[-1]) == 0 or int(el.split('-')[-1]) == 1 else 1, l)
+        )
+        return one_hot
+
+    one_hot = df['categories'].apply(lambda x: extract_label(x))
+    del df['categories']
+    # add other columns of each category and it is corresponding value 0/1, this will serve to do data analysis later on
+    one_hot_transposed = np.array(one_hot.to_list()).transpose()
+    for i, l in enumerate(categories):
+        df[l] = one_hot_transposed[i]
     return df
 
 
@@ -126,4 +145,5 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    # main()
+    index()

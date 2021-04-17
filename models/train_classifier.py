@@ -1,6 +1,7 @@
 # import libraries
 import sqlite3
 from pathlib import Path
+import os
 import pandas as pd
 import numpy as np
 import gc
@@ -179,13 +180,16 @@ def train_and_validate():
 
     # trange is a tqdm wrapper around the normal python range
     for i in trange(epochs, desc="Epoch"):
-        # check if F1 has flattened, note here that because of computational capicity limitation, I assume that flatten
-        # for me is only to check that between the last epoch and current epoch the gain in F1 micro was smaller than 1%
-        # otherwise if F1 ccontinues to grow that it will capped by the # epochs
-        if i > 1:
+        # check if F1 has flattened, note here that because of computational capacity limitation, I assume that flatten
+        # for me is only to check that for 2 consecutive epochs F1 haven't increased by at least 1 %, otherwise if
+        # F1 continues to grow then it will be capped by the # epochs
+        if i > 2:
             f1_current = f1_set[-1]
             f1_previous = f1_set[-2]
-            diff = f1_current - f1_previous
+            f1_before_previous = f1_set[-3]
+            diff_curr = f1_current - f1_previous
+            diff_prev = f1_previous - f1_before_previous
+            diff = (diff_curr + diff_prev)/2
             if diff < 1:
                 break
 
@@ -273,11 +277,11 @@ def train_and_validate():
         f1_set.append(val_f1_accuracy_micro)
 
         print('F1 Validation Score Micro: ', val_f1_accuracy_micro)
-        print('\n F1 Validation Score Macro: ', val_f1_accuracy_macro)
+        print('F1 Validation Score Macro: ', val_f1_accuracy_macro)
         print('Flat Validation Accuracy: ', val_flat_accuracy)
 
     # store the best model
-    torch.save(model.state_dict(), 'finetuned_distilbert')
+    model.save_pretrained('finetuned_distilbert')
 
     # finetune the threshold by maximizing F1 first with macro_thresholds on the order of e ^ -1 then with
     # micro_thresholds on the order of e ^ -2
@@ -307,7 +311,7 @@ def train_and_validate():
 def test_and_print_report():
 
     # load model
-    model = torch.load('finetuned_distilbert')
+    model = DistilBertForSequenceClassification.from_pretrained('finetuned_distilbert').to(device)
     # load test dataloader
     test_dataloader = torch.load('test_data_loader')
     # load list of labels
@@ -325,10 +329,10 @@ def test_and_print_report():
     for i, batch in enumerate(test_dataloader):
         batch = tuple(t.to(device) for t in batch)
         # Unpack the inputs from the dataloader
-        b_input_ids, b_input_mask, b_labels, b_token_types = batch
+        b_input_ids, b_input_mask, b_labels = batch
         with torch.no_grad():
             # Forward pass
-            outs = model(b_input_ids, token_type_ids=None, attention_mask=b_input_mask)
+            outs = model(b_input_ids, attention_mask=b_input_mask)
             b_logit_pred = outs[0]
             pred_label = torch.sigmoid(b_logit_pred)
 
@@ -360,12 +364,12 @@ def test_and_print_report():
 
 
 
-train , validation, test = Path('./train_data_loader'), Path('./validation_data_loader'), Path('./test_data')
-finetuned_model = Path('./finetuned_distilbert')
+train , validation, test = Path('./train_data_loader'), Path('./validation_data_loader'), Path('./test_data_loader')
+finetuned_model = './finetuned_distilbert'
 if not (train.is_file() and validation.is_file() and test.is_file()):
     data = load_data_and_build_labels()
     data = data_analysis_and_fix_data(data)
     prepare_data(data)
-if not finetuned_model.is_file():
+if not os.path.exists(finetuned_model):
     train_and_validate()
 test_and_print_report()
