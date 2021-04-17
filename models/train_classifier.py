@@ -13,6 +13,7 @@ from transformers import *
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score, accuracy_score, classification_report
 from tqdm import tqdm, trange
+from sqlalchemy import create_engine
 
 
 # Implement a machine learning pipeline that is responsible for:
@@ -31,34 +32,20 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 n_gpu = torch.cuda.device_count()
 torch.cuda.get_device_name(0)
 
-categories = []
 max_length = 300
 batch_size = 32 # batch size
 epochs = 10 # Number of training epochs (authors recommend between 2 and 4)
 
-def load_data_and_build_labels():
-    global categories
+def load_data():
     conn = sqlite3.connect('../data/db.sqlite')
-    data = pd.read_sql('select id, message, categories from disaster', conn)
-    data.set_index('id')
-    categ = data.values[0][2].split(';')
-    categories = list(map(lambda el:el.split('-')[0],categ))
-    def extract_label(s):
-        l = s.split(';')
-        # there are some error in collecting the data where some labels are given 2 instead of 0/1,
-        # I will assume that 2 means 1 and fix it here when constructing one hot encoding
-        one_hot = list(map(
-            lambda el: int(el.split('-')[-1]) if int(el.split('-')[-1]) == 0 or int(el.split('-')[-1]) == 1 else 1,l)
-        )
-        return one_hot
-    # create one hot encoding of the labels
-    data['one_hot'] = data['categories'].apply(lambda x:extract_label(x))
-    del data['categories']
-    # add other columns of each category and it is corresponding value 0/1, this will serve to do data analysis later on
-    one_hot_transposed = np.array(data.one_hot.to_list()).transpose()
-    for i,l in enumerate(categories):
-        data[l] = one_hot_transposed[i]
-    return data
+    df = pd.read_sql('select * from disaster', conn)
+    return df
+
+def create_one_hot(df):
+    global categories
+    categories = list(df.columns[4:])
+    df['one_hot'] = list(df[categories].values)
+    return df
 
 def data_analysis_and_fix_data(df):
 
@@ -190,7 +177,7 @@ def train_and_validate():
             diff_curr = f1_current - f1_previous
             diff_prev = f1_previous - f1_before_previous
             diff = (diff_curr + diff_prev)/2
-            if diff < 1:
+            if diff < 1 and diff_curr < 1:
                 break
 
         # Training
@@ -337,6 +324,7 @@ def test_and_print_report():
             pred_label = torch.sigmoid(b_logit_pred)
 
             b_logit_pred = b_logit_pred.detach().cpu().numpy()
+            # TODO thabet fel detach
             pred_label = pred_label.to('cpu').numpy()
             b_labels = b_labels.to('cpu').numpy()
 
@@ -362,14 +350,14 @@ def test_and_print_report():
     pickle.dump(clf_report, open('classification_report.txt', 'wb'))  # save report
     print(clf_report)
 
-
-
-train , validation, test = Path('./train_data_loader'), Path('./validation_data_loader'), Path('./test_data_loader')
-finetuned_model = './finetuned_distilbert'
-if not (train.is_file() and validation.is_file() and test.is_file()):
-    data = load_data_and_build_labels()
-    data = data_analysis_and_fix_data(data)
-    prepare_data(data)
-if not os.path.exists(finetuned_model):
-    train_and_validate()
-test_and_print_report()
+if __name__ == '__main__':
+    train , validation, test = Path('./train_data_loader'), Path('./validation_data_loader'), Path('./test_data_loader')
+    finetuned_model = './finetuned_distilbert'
+    if not (train.is_file() and validation.is_file() and test.is_file()):
+        data = load_data()
+        data = create_one_hot(data)
+        data = data_analysis_and_fix_data(data)
+        prepare_data(data)
+    if not os.path.exists(finetuned_model):
+        train_and_validate()
+    test_and_print_report()

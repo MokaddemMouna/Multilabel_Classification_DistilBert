@@ -48,17 +48,25 @@ def clean_data(df):
     df['message'] = df['message'].apply(lambda txt: txt.replace('@', '').replace('#', ''), re.MULTILINE)
 
 
+def load_data_and_build_labels(df):
+    categ = df.categories.values[0].split(';')
+    categories = list(map(lambda el:el.split('-')[0],categ))
+    for i,c in enumerate(categories):
+        df[c] = df.categories.apply(lambda e: e.split(';')[i].split('-')[-1])
+    del df['categories']
+    return df
+
 
 def store_data(df):
     conn = sqlite3.connect('./db.sqlite')
-    df.to_sql('disaster', conn, if_exists='replace', index=True)
-
-
+    df.to_sql('disaster', conn, if_exists='replace', index=False)
 
 
 df_data = loads_and_merge_data()
 clean_data(df_data)
+df_data = load_data_and_build_labels(df_data)
 store_data(df_data)
+
 
 
 
